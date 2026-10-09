@@ -971,6 +971,7 @@ ${contentText}${imageText}`, session);
       });
 
       ws.on("error", (err: any) => {
+        if (isManualDisconnect) return;
         const errMsg = String(err);
         log(`[wecombot] ❌ ${bot.name || bot.botId}`, err);
         connected = false;
