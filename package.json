@@ -1,6 +1,6 @@
 {
   "name": "pi-wecombot",
-  "version": "1.1.12",
+  "version": "1.1.13",
   "type": "module",
   "description": "企业微信智能机器人 WebSocket 长连接扩展 for pi",
   "keywords": [
@@ -27,11 +27,12 @@
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*"
   },
   "dependencies": {
-    "aibot-node-sdk": "^1.0.3"
+    "@sinclair/typebox": "^0.34.52",
+    "@wecom/aibot-node-sdk": "^1.0.7"
   }
 }

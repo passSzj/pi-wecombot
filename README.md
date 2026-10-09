@@ -73,6 +73,7 @@ pi install git:github.com/huang-x-h/pi-wecombot
 | `wecombot-disable` | **会话配置** | 禁用本会话的机器人连接（**仅本会话**） |
 | `wecombot-status` | **混合** | 显示全局列表 + 本会话状态 |
 | `wecombot-session-info` | **会话配置** | 显示本会话配置信息 |
+| `wecombot-new` / `/new` | **会话联动** | 新建会话并无缝切换机器人连接，联动 pi-web 增加新会话 |
 
 ## 快速开始
 
@@ -219,6 +220,16 @@ pi install git:github.com/huang-x-h/pi-wecombot
 【会话】连接状态: 🟢 已连接
 【会话】活跃消息会话: 2 个
 ```
+
+#### `/new` 或 `/wecombot-new` - 新建会话并切换（联动 pi-web）
+
+在企业微信中直接发送 `/new`（或在 Web/终端中执行 `/wecombot-new`），会自动：
+1. 优先调用 pi-web 的 API（默认 `http://127.0.0.1:30141/api/agent/new`）新建一个全新的 pi session；
+2. 自动将当前活跃的机器人配置继承至新 session；
+3. 断开旧 session 的机器人长连，由新 session 接管 WebSocket 连接；
+4. pi-web 的左侧侧边栏会联动即时出现新增的 session，后续在企微中的对话将全部路由至新 session，不再停留在旧 session 中。
+
+> **支持指令格式**：`/new`、`/clear`、`/reset`（群聊中包含 `@机器人 /new` 亦可自动识别）。
 
 ## 使用场景示例
 

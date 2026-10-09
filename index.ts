@@ -10,10 +10,43 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { WSClient, generateReqId, decryptFile } from "aibot-node-sdk";
+import { randomUUID } from "node:crypto";
+import { WSClient, generateReqId, decryptFile } from "@wecom/aibot-node-sdk";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+
+// ============================================================================
+// Logger Helper
+// ============================================================================
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+function log(message?: any, ...optionalParams: any[]) {
+  if (typeof message === "string" && message.startsWith("[wecombot]")) {
+    console.log(`[${now()}] ${message}`, ...optionalParams);
+  } else {
+    console.log(`[${now()}] [wecombot]`, message, ...optionalParams);
+  }
+}
+
+function logError(message?: any, ...optionalParams: any[]) {
+  if (typeof message === "string" && message.startsWith("[wecombot]")) {
+    console.error(`[${now()}] ${message}`, ...optionalParams);
+  } else {
+    console.error(`[${now()}] [wecombot]`, message, ...optionalParams);
+  }
+}
+
+function logWarn(message?: any, ...optionalParams: any[]) {
+  if (typeof message === "string" && message.startsWith("[wecombot]")) {
+    console.warn(`[${now()}] ${message}`, ...optionalParams);
+  } else {
+    console.warn(`[${now()}] [wecombot]`, message, ...optionalParams);
+  }
+}
 
 // ============================================================================
 // Global Error Handlers
@@ -25,11 +58,11 @@ process.on("unhandledRejection", (reason) => {
   if (reason && typeof reason === "object") {
     const err = reason as any;
     if (err.errcode === 846608 || err.message?.includes("expired") || err.message?.includes("stream message update expired")) {
-      console.log("[wecombot] 忽略流过期错误");
+      log("[wecombot] 忽略流过期错误");
       return;
     }
   }
-  console.error("[wecombot] 未捕获的 promise rejection:", reason);
+  logError("[wecombot] 未捕获的 promise rejection:", reason);
 });
 
 // ============================================================================
@@ -45,6 +78,7 @@ interface BotConfig {
 // 全局配置：所有会话共享机器人列表
 interface GlobalConfig {
   bots: BotConfig[];
+  piWebUrl?: string; // 可选的 pi-web 服务地址（默认 http://127.0.0.1:30141）
 }
 
 // 会话配置：每个会话独立选择启用哪个机器人
@@ -95,15 +129,12 @@ function getSessionTempPath(sessionId: string): string {
 }
 
 // 全局变量
-let SESSION_ID: string;
 let GLOBAL_CONFIG: string;
-let SESSION_CONFIG: string;
-let TEMP: string;
 
 const PROMPT = `
 [wecom-bot] 企业微信机器人已连接
 - 收到 @机器人 的消息会自动处理
-- 回复会自动发送到对应用户的会话
+- 你的回复会自动发送到对应用户的企业微信，直接输出正文即可，无需调用 wecombot-send
 - 使用 wecombot-attach 发送文件`;
 
 // ============================================================================
@@ -114,7 +145,7 @@ const PROMPT = `
 async function loadGlobalConfig(): Promise<GlobalConfig> {
   try {
     const data = JSON.parse(await readFile(GLOBAL_CONFIG, "utf8"));
-    return { bots: data.bots || [] };
+    return { bots: data.bots || [], piWebUrl: data.piWebUrl };
   } catch {
     return { bots: [] };
   }
@@ -126,20 +157,31 @@ async function saveGlobalConfig(c: GlobalConfig) {
   await writeFile(GLOBAL_CONFIG, JSON.stringify(c, null, "\t") + "\n");
 }
 
-// 加载会话配置（会话选择的机器人和启用状态）
-async function loadSessionConfig(): Promise<SessionConfig> {
-  try {
-    const data = JSON.parse(await readFile(SESSION_CONFIG, "utf8"));
-    return { activeBotId: data.activeBotId, enabled: data.enabled ?? true };
-  } catch {
-    return { enabled: true };
-  }
+// 保存指定会话的配置（用于新开会话继承机器人）
+async function saveSessionConfigForId(sessionId: string, c: SessionConfig) {
+  const cfgPath = getSessionConfigPath(sessionId);
+  await mkdir(dirname(cfgPath), { recursive: true });
+  await writeFile(cfgPath, JSON.stringify(c, null, "\t") + "\n");
 }
 
-// 保存会话配置
-async function saveSessionConfig(c: SessionConfig) {
-  await mkdir(dirname(SESSION_CONFIG), { recursive: true });
-  await writeFile(SESSION_CONFIG, JSON.stringify(c, null, "\t") + "\n");
+// 获取 pi-web 访问地址
+function getPiWebUrl(globalCfg?: GlobalConfig): string {
+  if (globalCfg?.piWebUrl) return globalCfg.piWebUrl.replace(/\/+$/, "");
+  if (process.env.PI_WEB_URL) return process.env.PI_WEB_URL.replace(/\/+$/, "");
+  const port = process.env.PI_WEB_PORT || process.env.PORT || "30141";
+  return `http://127.0.0.1:${port}`;
+}
+
+// 获取请求 pi-web API 所需的请求头（包括 Basic Auth 如果设置了密码）
+function getPiWebHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  const password = process.env.PI_WEB_PASSWORD;
+  if (password) {
+    headers["Authorization"] = `Basic ${Buffer.from(`pi:${password}`).toString("base64")}`;
+  }
+  return headers;
 }
 
 function getActiveBot(bots: BotConfig[], activeBotId?: string): BotConfig | undefined {
@@ -158,7 +200,39 @@ export default function (pi: ExtensionAPI) {
   // 初始化路径（会话身份依赖 ctx，延迟到 session_start 解析）
   GLOBAL_CONFIG = getGlobalConfigPath();
 
-  console.log(`[wecombot] 全局配置: ${GLOBAL_CONFIG}`);
+  log(`[wecombot] 全局配置: ${GLOBAL_CONFIG}`);
+
+  // 会话私有身份与路径（实例隔离，严防多会话互相覆盖）
+  let sessionId = "";
+  let sessionConfigPath = "";
+  let tempDir = "";
+  let isManualDisconnect = false;
+
+  // 加载本会话配置（会话选择的机器人和启用状态）
+  async function loadSessionConfig(): Promise<SessionConfig> {
+    if (!sessionConfigPath) return { enabled: true };
+    try {
+      const data = JSON.parse(await readFile(sessionConfigPath, "utf8"));
+      return { activeBotId: data.activeBotId, enabled: data.enabled ?? true };
+    } catch {
+      return { enabled: true };
+    }
+  }
+
+  // 保存本会话配置
+  async function saveSessionConfig(c: SessionConfig) {
+    if (!sessionConfigPath) return;
+    await mkdir(dirname(sessionConfigPath), { recursive: true });
+    await writeFile(sessionConfigPath, JSON.stringify(c, null, "\t") + "\n");
+  }
+
+  // 获取本会话专属临时目录
+  function getTempDir(): string {
+    if (!tempDir) {
+      tempDir = getSessionTempPath(sessionId || "default");
+    }
+    return tempDir;
+  }
 
   // 全局机器人列表（从全局配置加载）
   let globalBots: BotConfig[] = [];
@@ -189,6 +263,7 @@ export default function (pi: ExtensionAPI) {
   const pendingMessages: PendingMessage[] = [];
   let isProcessing = false;
   let currentReqId: string | null = null;  // 当前正在处理的 reqId
+  let hasSentViaTool = false;              // 当前请求是否已通过工具（如 wecombot-send）发送了回复
 
   // 消息进度跟踪（持续通知）
   const messageTimeouts = new Map<string, NodeJS.Timeout>();
@@ -255,9 +330,11 @@ export default function (pi: ExtensionAPI) {
         ws?.replyStream(session.frame, session.streamId, point.message, true).catch((err: any) => {
           // 忽略超时错误
           if (err?.errcode !== 846608) {
-            console.error(`[wecombot] 进度通知失败:`, err);
+            logError(`[wecombot] 进度通知失败:`, err);
           }
         });
+        // 结束该流后为该会话生成新的 streamId，避免后续消息复用已结束的流
+        session.streamId = generateReqId("stream");
         break;
       }
     }
@@ -309,7 +386,7 @@ export default function (pi: ExtensionAPI) {
     // 检查会话是否还存在
     if (!sessions.has(message.reqId)) {
       // 会话已过期，移除并处理下一条
-      console.log(`[wecombot] 会话 ${message.reqId.slice(0, 8)} 已过期，跳过`);
+      log(`[wecombot] 会话 ${message.reqId.slice(0, 8)} 已过期，跳过`);
       pendingMessages.shift();
       isProcessing = false;
       processMessageQueue();
@@ -317,6 +394,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     currentReqId = message.reqId;
+    hasSentViaTool = false;
 
     // 【增强】启动持续进度通知
     const session = sessions.get(message.reqId);
@@ -326,15 +404,17 @@ export default function (pi: ExtensionAPI) {
 
     try {
       await pi.sendUserMessage([{ type: "text", text: message.text }], { deliverAs: "steer" });
-      console.log(`[wecombot] 消息已发送: reqId=${message.reqId.slice(0, 8)}, 队列剩余=${pendingMessages.length - 1}`);
+      log(`[wecombot] 消息已发送: reqId=${message.reqId.slice(0, 8)}, 队列剩余=${pendingMessages.length - 1}`);
     } catch (err: any) {
       if (err?.message?.includes('already processing')) {
-        console.log('[wecombot] Agent 忙，消息将在 500ms 后重试');
+        log('[wecombot] Agent 忙，消息将在 500ms 后重试');
         currentReqId = null;
+        hasSentViaTool = false;
       } else {
-        console.error('[wecombot] 发送消息失败:', err);
+        logError('[wecombot] 发送消息失败:', err);
         pendingMessages.shift();  // 移除失败消息
         currentReqId = null;
+        hasSentViaTool = false;
       }
     }
 
@@ -377,9 +457,10 @@ export default function (pi: ExtensionAPI) {
     try {
       const active = getActiveBot(globalBots, sessionCfg.activeBotId);
 
-      // 已连接才显示状态栏
-      if (!connected || !ctx) {
-        ctx?.ui.setStatus("wecombot", "");
+      // 已连接或有提示时显示状态栏
+      if (!ctx) return;
+      if (!connected && !msg) {
+        ctx.ui.setStatus("wecombot", "");
         return;
       }
 
@@ -395,7 +476,7 @@ export default function (pi: ExtensionAPI) {
     } catch (err: any) {
       // 忽略 ctx 已失效错误（正常现象，session 替换时旧回调会触发）
       if (err?.message?.includes("stale")) {
-        console.log("[wecombot] setStatus: ctx 已失效，忽略");
+        log("[wecombot] setStatus: ctx 已失效，忽略");
         return;
       }
       throw err;
@@ -403,44 +484,274 @@ export default function (pi: ExtensionAPI) {
   }
 
   // 回复
-  function replyTo(reqId: string, content: string, isEnd = true) {
+  function replyTo(reqId: string, content: string, isEnd = true): Promise<any> {
     if (!ws || !connected) {
-      console.log(`[wecombot] 回复失败: ws未连接, reqId=${reqId.slice(0, 8)}`);
-      return;
+      log(`[wecombot] 回复失败: ws未连接, reqId=${reqId.slice(0, 8)}`);
+      return Promise.resolve();
     }
     const session = sessions.get(reqId);
     if (!session) {
-      console.log(`[wecombot] 回复失败: 会话不存在, reqId=${reqId.slice(0, 8)}, 当前sessions=${sessions.size}`);
-      return;
+      log(`[wecombot] 回复失败: 会话不存在, reqId=${reqId.slice(0, 8)}, 当前sessions=${sessions.size}`);
+      return Promise.resolve();
     }
-    ws.replyStream(session.frame, session.streamId, content, isEnd).catch((err: any) => {
+    const p = ws.replyStream(session.frame, session.streamId, content, isEnd).catch((err: any) => {
       // 忽略流已过期错误（正常情况，10分钟后自动触发）
       if (err?.errcode === 846608 || err?.message?.includes('expired')) {
-        console.log(`[wecombot] 流已过期: reqId=${reqId.slice(0, 8)}`);
+        log(`[wecombot] 流已过期: reqId=${reqId.slice(0, 8)}`);
       } else {
-        console.error(`[wecombot] 回复异常: reqId=${reqId.slice(0, 8)}`, err);
+        logError(`[wecombot] 回复异常: reqId=${reqId.slice(0, 8)}`, err);
       }
     });
+    // 当流式消息结束时，为该会话生成新的 streamId，确保后续消息不会覆盖已结束的气泡
+    if (isEnd) {
+      session.streamId = generateReqId("stream");
+    }
+    return p;
+  }
+
+  // 解析是否包含新会话重置指令
+  function parseCommandText(text: string): { isNew: boolean; args?: string } {
+    const cleaned = text.trim().replace(/^@\S+\s*/, "").trim();
+    if (cleaned === "/new" || cleaned === "/clear" || cleaned === "/reset") {
+      return { isNew: true };
+    }
+    if (cleaned.startsWith("/new ") || cleaned.startsWith("/clear ") || cleaned.startsWith("/reset ")) {
+      const spaceIndex = cleaned.indexOf(" ");
+      return { isNew: true, args: cleaned.slice(spaceIndex + 1).trim() };
+    }
+    return { isNew: false };
+  }
+
+  // 后备创建新会话（直接写 session 文件并使 pi-web 缓存失效）
+  async function createFallbackSession(cwd: string): Promise<string | null> {
+    try {
+      const timestamp = new Date().toISOString();
+      const newSessionId = randomUUID();
+      const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+      const sessionDir = join(homedir(), ".pi", "agent", "sessions", safePath);
+      await mkdir(sessionDir, { recursive: true });
+
+      const fileTimestamp = timestamp.replace(/[:.]/g, "-");
+      const sessionFile = join(sessionDir, `${fileTimestamp}_${newSessionId}.jsonl`);
+
+      const header = {
+        type: "session",
+        version: 3,
+        id: newSessionId,
+        timestamp,
+        cwd,
+      };
+      await writeFile(sessionFile, JSON.stringify(header) + "\n");
+      log(`[wecombot] 后备模式: 已直接创建 session 文件 ${sessionFile}`);
+
+      // 通知内存中的 pi-web 缓存失效
+      if (typeof (globalThis as any).__piSessionListGeneration === "number") {
+        (globalThis as any).__piSessionListGeneration += 1;
+        (globalThis as any).__piSessionListCache = undefined;
+      }
+      return newSessionId;
+    } catch (err) {
+      logError(`[wecombot] 后备创建 session 失败:`, err);
+      return null;
+    }
+  }
+
+  // 触发新会话加载并接管连接
+  async function triggerSessionReload(newSessionId: string, piWebUrl: string) {
+    // 方式 A：进程内直接调用已注册的 AgentSessionWrapper
+    const inMemoryWrapper = (globalThis as any).__piSessions?.get(newSessionId);
+    if (inMemoryWrapper && typeof inMemoryWrapper.send === "function") {
+      log(`[wecombot] 正在通过进程内 AgentSessionWrapper 触发新会话 reload: ${newSessionId.slice(0, 8)}`);
+      try {
+        await inMemoryWrapper.send({ type: "reload" });
+        log(`[wecombot] 进程内 reload 触发成功`);
+        return;
+      } catch (err) {
+        logWarn(`[wecombot] 进程内 reload 异常，尝试 HTTP API:`, err);
+      }
+    }
+
+    // 方式 B：通过 HTTP 接口触发
+    try {
+      log(`[wecombot] 正在通过 HTTP POST /api/agent/${newSessionId.slice(0, 8)} 触发 reload`);
+      const res = await fetch(`${piWebUrl}/api/agent/${encodeURIComponent(newSessionId)}`, {
+        method: "POST",
+        headers: getPiWebHeaders(),
+        body: JSON.stringify({ type: "reload" }),
+      });
+      if (res.ok) {
+        log(`[wecombot] HTTP reload 触发成功`);
+      } else {
+        logWarn(`[wecombot] HTTP reload 返回状态码: ${res.status}`);
+      }
+    } catch (err: any) {
+      logWarn(`[wecombot] HTTP reload 请求异常:`, err?.message || err);
+    }
+  }
+
+  // 处理新会话切换逻辑
+  async function handleNewSessionCommand(
+    reqId: string,
+    session: Session,
+    bot: BotConfig,
+    initialPrompt?: string
+  ) {
+    try {
+      log(`[wecombot] 收到新会话重置指令，开始创建并切换新会话...`);
+
+      // 1. 中断旧会话可能正在运行的任务并清空队列
+      if (currentCtx) {
+        try { currentCtx.abort(); } catch {}
+      }
+      clearProgressNotifier(currentReqId || "");
+      pendingMessages.length = 0;
+      currentReqId = null;
+      isProcessing = false;
+      hasSentViaTool = false;
+
+      // 2. 发送过渡反馈
+      if (session.frame) {
+        await replyTo(reqId, "🔄 正在创建并切换至新会话...", false);
+      }
+
+      const currentBotId = sessionCfg.activeBotId || bot.botId;
+      const cwd = currentCtx?.cwd || process.cwd();
+      const globalCfg = await loadGlobalConfig();
+      const piWebUrl = getPiWebUrl(globalCfg);
+
+      let newSessionId: string | null = null;
+
+      // 3. 优先通过 pi-web 创建新 session
+      try {
+        log(`[wecombot] 请求 pi-web 创建新会话: ${piWebUrl}/api/agent/new, cwd=${cwd}`);
+        const res = await fetch(`${piWebUrl}/api/agent/new`, {
+          method: "POST",
+          headers: getPiWebHeaders(),
+          body: JSON.stringify({
+            cwd,
+            type: "ensure_session",
+            ...(currentCtx?.model ? {
+              provider: currentCtx.model.provider,
+              modelId: currentCtx.model.id,
+            } : {}),
+            ...((currentCtx as any)?.thinkingLevel ? {
+              thinkingLevel: (currentCtx as any).thinkingLevel,
+            } : {}),
+          }),
+        });
+
+        if (res.ok) {
+          const data = (await res.json()) as any;
+          if (data?.success && data?.sessionId) {
+            newSessionId = data.sessionId;
+            log(`[wecombot] pi-web 创建新会话成功: ${newSessionId?.slice(0, 8)}`);
+          }
+        } else {
+          logWarn(`[wecombot] pi-web /api/agent/new 响应状态码 ${res.status}: ${await res.text()}`);
+        }
+      } catch (err: any) {
+        logWarn(`[wecombot] 请求 pi-web /api/agent/new 异常:`, err?.message || err);
+      }
+
+      // 4. 若无法连接 pi-web，则采用本地创建 session 文件的后备方案
+      if (!newSessionId) {
+        newSessionId = await createFallbackSession(cwd);
+      }
+
+      if (!newSessionId) {
+        throw new Error("创建新会话失败，无法生成新会话");
+      }
+
+      // 5. 将当前机器人的活跃配置写入新会话
+      await saveSessionConfigForId(newSessionId, {
+        activeBotId: currentBotId,
+        enabled: true,
+      });
+      log(`[wecombot] 新会话配置已写入: ${newSessionId.slice(0, 8)}`);
+
+      // 6. 给企微用户发送成功通知并结束气泡
+      if (session.frame) {
+        await replyTo(reqId, "✅ 已开启新会话，开始新的对话吧！", true);
+        // 等待 300ms 保证 WebSocket 消息帧发送完毕
+        await new Promise((r) => setTimeout(r, 300));
+      }
+
+      // 7. 禁用本会话并断开本会话连接，释放 BotID 长连
+      sessionCfg.enabled = false;
+      await saveSessionConfig(sessionCfg);
+      disconnect();
+      setStatus(currentCtx, "已切换到新会话");
+
+      // 等待 500ms 确保旧长连在网关完全断开释放，避免与新会话连接产生竞争
+      await new Promise((r) => setTimeout(r, 500));
+
+      // 8. 触发新会话 reload 以接管机器人连接
+      await triggerSessionReload(newSessionId, piWebUrl);
+
+      // 9. 如果用户在 /new 后附带了文本（例如 `/new 请帮我分析...`），延迟发送到新会话
+      if (initialPrompt && initialPrompt.trim()) {
+        setTimeout(async () => {
+          try {
+            await fetch(`${piWebUrl}/api/agent/${encodeURIComponent(newSessionId!)}`, {
+              method: "POST",
+              headers: getPiWebHeaders(),
+              body: JSON.stringify({
+                type: "prompt",
+                message: `[wecombot] [${bot.name || bot.botId}] [${session.userId}]\n${initialPrompt.trim()}`,
+              }),
+            });
+          } catch (e) {
+            logError(`[wecombot] 发送初始消息异常:`, e);
+          }
+        }, 1500);
+      }
+
+    } catch (err: any) {
+      logError(`[wecombot] 切换新会话失败:`, err);
+      if (session.frame) {
+        replyTo(reqId, `❌ 切换新会话失败: ${err?.message || String(err)}`, true);
+      }
+    }
   }
 
   // 连接 - 添加错误保护
   async function connect(ctx: ExtensionContext, bot: BotConfig): Promise<boolean> {
     try {
       disconnect();
+      isManualDisconnect = false;
 
-      console.log(`[wecombot] 连接中: ${bot.name || bot.botId}`);
-      console.log(`[wecombot] ⚠️ 提示: 同一机器人只能有一个连接，其他会话将被断开`);
+      log(`[wecombot] 连接中: ${bot.name || bot.botId}`);
+      log(`[wecombot] ⚠️ 提示: 同一机器人只能有一个连接，其他会话将被断开`);
 
-      ws = new WSClient({ botId: bot.botId, secret: bot.secret });
+      ws = new WSClient({
+        botId: bot.botId,
+        secret: bot.secret,
+        reconnectInterval: 2000,
+        maxReconnectAttempts: -1, // 无限重连，断线后持续退避重连
+        maxAuthFailureAttempts: 5, // 认证失败重试5次
+        heartbeatInterval: 20000, // 20秒心跳保活，避免网关超时断开
+        logger: {
+          debug: () => {},
+          info: (msg, ...args) => log(`[AiBotSDK] [INFO] ${msg}`, ...args),
+          warn: (msg, ...args) => logWarn(`[AiBotSDK] [WARN] ${msg}`, ...args),
+          error: (msg, ...args) => logError(`[AiBotSDK] [ERROR] ${msg}`, ...args),
+        },
+      });
 
       ws.on("connected", () => {
-        console.log(`[wecombot] ✅ ${bot.name || bot.botId} 已连接`);
+        log(`[wecombot] ✅ ${bot.name || bot.botId} 已连接`);
         connected = true;
         setStatus(currentCtx);
       });
 
+      ws.on("reconnecting", (attempt: number) => {
+        log(`[wecombot] 🔄 ${bot.name || bot.botId} 正在尝试重连 (第 ${attempt} 次)...`);
+        connected = false;
+        setStatus(currentCtx, `重连中(${attempt})`);
+      });
+
       ws.on("authenticated", () => {
-        console.log(`[wecombot] ✅ ${bot.name || bot.botId} 认证成功`);
+        log(`[wecombot] ✅ ${bot.name || bot.botId} 认证成功`);
         connected = true;
         setStatus(currentCtx);
         if (!toolsRegistered) {
@@ -449,7 +760,7 @@ export default function (pi: ExtensionAPI) {
         }
       });
 
-      ws.on("message.text", (frame: any) => {
+      ws.on("message.text", async (frame: any) => {
         const content = frame.body?.text?.content || "";
         if (!content) return;
 
@@ -459,10 +770,17 @@ export default function (pi: ExtensionAPI) {
         const botId = bot.botId;
         const botName = bot.name;
 
-        console.log(`[wecombot] [${botName || botId}] [${userId}] ${content.slice(0, 30)}`);
+        log(`[wecombot] [${botName || botId}] [${userId}] ${content.slice(0, 30)}`);
 
         const session: Session = { frame, streamId: generateReqId("stream"), userId, chatId, timestamp: Date.now(), botId };
         sessions.set(reqId, session);
+
+        // 拦截是否为新会话重置指令 (/new, /clear, /reset)
+        const cmd = parseCommandText(content);
+        if (cmd.isNew) {
+          await handleNewSessionCommand(reqId, session, bot, cmd.args);
+          return;
+        }
 
         replyTo(reqId, "🤔 思考中...", false);
         // 消息关联 reqId 入队，传入 session
@@ -485,13 +803,13 @@ export default function (pi: ExtensionAPI) {
             const base64Image = buffer.toString('base64');
             // 保存到临时目录
             const filename = `img_${Date.now()}.jpg`;
-            const filepath = join(TEMP, filename);
+            const filepath = join(getTempDir(), filename);
             await writeFile(filepath, buffer);
-            console.log(`[wecombot] 图片已保存: ${filepath}`);
+            log(`[wecombot] 图片已保存: ${filepath}`);
             queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片: ${filepath}
 [base64图片: data:image/jpeg;base64,${base64Image.substring(0, 100)}...]`, session);
           } catch (err) {
-            console.error(`[wecombot] 图片下载失败:`, err);
+            logError(`[wecombot] 图片下载失败:`, err);
             queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了图片（下载失败）: ${url}`, session);
           }
         }
@@ -528,13 +846,13 @@ export default function (pi: ExtensionAPI) {
             try {
               const { buffer } = await ws.downloadFile(img.url, img.aeskey);
               const filename = `img_${Date.now()}.jpg`;
-              const filepath = join(TEMP, filename);
+              const filepath = join(getTempDir(), filename);
               await writeFile(filepath, buffer);
-              console.log(`[wecombot] mixed图片已保存: ${filepath}`);
+              log(`[wecombot] mixed图片已保存: ${filepath}`);
               imageText += `
 [图片: ${filepath}]`;
             } catch (err) {
-              console.error(`[wecombot] mixed图片下载失败:`, err);
+              logError(`[wecombot] mixed图片下载失败:`, err);
               imageText += `
 [图片（下载失败）: ${img.url}]`;
             }
@@ -579,12 +897,12 @@ ${contentText}${imageText}`, session);
             if (!ws) throw new Error("WS未连接");
             const { buffer, filename: downloadedFilename } = await ws.downloadFile(url, aesKey);
             const savedFilename = downloadedFilename || filename;
-            const filepath = join(TEMP, `file_${Date.now()}_${savedFilename}`);
+            const filepath = join(getTempDir(), `file_${Date.now()}_${savedFilename}`);
             await writeFile(filepath, buffer);
-            console.log(`[wecombot] 文件已保存: ${filepath}`);
+            log(`[wecombot] 文件已保存: ${filepath}`);
             queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了文件「${savedFilename}」: ${filepath}`, session);
           } catch (err) {
-            console.error(`[wecombot] 文件下载失败:`, err);
+            logError(`[wecombot] 文件下载失败:`, err);
             queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了文件「${filename}」（下载失败）: ${url}`, session);
           }
         }
@@ -604,12 +922,12 @@ ${contentText}${imageText}`, session);
           try {
             if (!ws) throw new Error("WS未连接");
             const { buffer } = await ws.downloadFile(url, aesKey);
-            const filepath = join(TEMP, `video_${Date.now()}.mp4`);
+            const filepath = join(getTempDir(), `video_${Date.now()}.mp4`);
             await writeFile(filepath, buffer);
-            console.log(`[wecombot] 视频已保存: ${filepath}`);
+            log(`[wecombot] 视频已保存: ${filepath}`);
             queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了视频: ${filepath}`, session);
           } catch (err) {
-            console.error(`[wecombot] 视频下载失败:`, err);
+            logError(`[wecombot] 视频下载失败:`, err);
             queueMessage(reqId, `[wecombot] [${bot.name || bot.botId}] [${userId}] 发送了视频（下载失败）: ${url}`, session);
           }
         }
@@ -624,23 +942,30 @@ ${contentText}${imageText}`, session);
         connected = false;
         sessions.clear();
 
+        if (isManualDisconnect) {
+          log(`[wecombot] ℹ️ ${bot.name || bot.botId} 已主动断开连接`);
+          setStatus(currentCtx);
+          return;
+        }
+
         const isKicked = reason?.includes("kick") || reason?.includes("replaced") || reason === "connection replaced";
         const disconnectMsg = isKicked ? `被其他会话踢掉` : `断开`;
 
-        console.log(`[wecombot] ❌ ${bot.name || bot.botId} ${disconnectMsg}${reason ? `: ${reason}` : ""}`);
+        log(`[wecombot] ❌ ${bot.name || bot.botId} ${disconnectMsg}${reason ? `: ${reason}` : ""}`);
 
         // 使用 currentCtx 而不是捕获的 ctx，避免 session 替换后 ctx 已失效
         const activeCtx = currentCtx;
-        if (wasConnected && isKicked) {
-          setStatus(activeCtx, `被其他会话连接 (${SESSION_ID.slice(0, 4)})`);
+        if (isKicked) {
+          setStatus(activeCtx, `被其他会话连接 (${sessionId.slice(0, 4)})`);
         } else {
-          setStatus(activeCtx);
+          // 普通网络异常断开（如 1006），SDK 会自动触发 reconnecting
+          setStatus(activeCtx, "已断开，准备重连");
         }
       });
 
       ws.on("error", (err: any) => {
         const errMsg = String(err);
-        console.log(`[wecombot] ❌ ${bot.name || bot.botId}`, err);
+        log(`[wecombot] ❌ ${bot.name || bot.botId}`, err);
         connected = false;
 
         // 使用 currentCtx 而不是捕获的 ctx，避免 session 替换后 ctx 已失效
@@ -660,7 +985,7 @@ ${contentText}${imageText}`, session);
       ws.connect();
       return true;
     } catch (err) {
-      console.error(`[wecombot] 连接异常:`, err);
+      logError(`[wecombot] 连接异常:`, err);
       connected = false;
       setStatus(ctx, "连接异常");
       return false;
@@ -668,6 +993,7 @@ ${contentText}${imageText}`, session);
   }
 
   function disconnect() {
+    isManualDisconnect = true;
     sessions.clear();
     if (ws) { ws.disconnect(); ws = null; }
     connected = false;
@@ -688,11 +1014,11 @@ ${contentText}${imageText}`, session);
       }),
       async execute(toolCallId, params, signal, onUpdate, ctx) {
         if (!isWecomConnected()) return { content: [{ type: "text", text: "⚠️ 机器人未连接" }], details: {} };
-        const reqId = sessions.keys().next().value;
+        const reqId = currentReqId || sessions.keys().next().value;
         if (!reqId) return { content: [{ type: "text", text: "⚠️ 无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。" }], details: {} };
         const files: string[] = [];
         for (const fp of params.paths) if ((await stat(fp)).isFile()) files.push(fp);
-        for (const fp of files) replyTo(reqId, `📎 ${basename(fp)}`, false);
+        for (const fp of files) replyTo(reqId, `📎 ${basename(fp)}`, true);
         return { content: [{ type: "text", text: `已添加 ${files.length} 个文件` }], details: {} };
       },
     });
@@ -701,16 +1027,17 @@ ${contentText}${imageText}`, session);
     pi.registerTool({
       name: "wecombot-send",
       label: "发送消息",
-      description: "发送消息到企业微信（仅在回复用户消息时可用）",
-      promptSnippet: "Send a text message to WeCom chat",
+      description: "向企业微信发送即时消息。注意：普通对话回复会在回合结束时自动发送给用户，无需调用此工具；仅在需要提前发送中间进展或多段独立消息时使用。",
+      promptSnippet: "Send an intermediate text message to WeCom chat",
       parameters: Type.Object({
         message: Type.String(),
       }),
       async execute(toolCallId, params, signal, onUpdate, ctx) {
         if (!isWecomConnected()) return { content: [{ type: "text", text: "⚠️ 机器人未连接" }], details: {} };
-        const reqId = sessions.keys().next().value;
+        const reqId = currentReqId || sessions.keys().next().value;
         if (!reqId) return { content: [{ type: "text", text: "⚠️ 无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。" }], details: {} };
         replyTo(reqId, params.message, true);
+        hasSentViaTool = true;
         return { content: [{ type: "text", text: "✅ 已发送" }], details: {} };
       },
     });
@@ -900,7 +1227,7 @@ ${contentText}${imageText}`, session);
 状态: ${statusText}
 全局机器人: ${globalBots.length} 个
 本会话活跃会话: ${sessions.size} 个
-会话ID: ${SESSION_ID.slice(0, 8)}`,
+会话ID: ${sessionId.slice(0, 8)}`,
         "info"
       );
     },
@@ -969,10 +1296,10 @@ ${sessionList}`, "info");
     description: "查看会话信息",
     handler: async (_args, ctx) => {
       const info = [
-        `会话ID: ${SESSION_ID}`,
+        `会话ID: ${sessionId}`,
         `全局配置: ${GLOBAL_CONFIG}`,
-        `会话配置: ${SESSION_CONFIG}`,
-        `临时目录: ${TEMP}`,
+        `会话配置: ${sessionConfigPath}`,
+        `临时目录: ${getTempDir()}`,
         ``,
         `【全局】机器人数量: ${globalBots.length}`,
         `【会话】启用机器人: ${sessionCfg.activeBotId || "无"}`,
@@ -981,6 +1308,70 @@ ${sessionList}`, "info");
         `【会话】活跃消息会话: ${sessions.size} 个`,
       ].join("\n");
       ctx.ui.notify(info, "info");
+    },
+  });
+
+  // 【会话】新建会话并切换（联动企微与 Web）
+  pi.registerCommand("wecombot-new", {
+    description: "新建会话并切换（联动企微与 Web）",
+    handler: async (_args, ctx) => {
+      const active = getActiveBot(globalBots, sessionCfg.activeBotId);
+      if (!active) {
+        ctx.ui.notify("当前未配置或未选择机器人", "error");
+        return;
+      }
+      ctx.ui.notify("🔄 正在创建并切换新会话...", "info");
+      const fakeSession: Session = {
+        frame: null,
+        streamId: "",
+        userId: "local",
+        chatId: "",
+        timestamp: Date.now(),
+        botId: active.botId,
+      };
+      await handleNewSessionCommand(generateReqId("cmd"), fakeSession, active);
+      ctx.ui.notify("✅ 新会话已创建，机器人已切换", "info");
+    },
+  });
+
+  // 同时也注册 /new 指令（便于在 Web 端或终端直接使用 /new 联动）
+  pi.registerCommand("new", {
+    description: "开启新会话（联动企微与 Web）",
+    handler: async (_args, ctx) => {
+      const active = getActiveBot(globalBots, sessionCfg.activeBotId);
+      ctx.ui.notify("🔄 正在创建并切换新会话...", "info");
+      const fakeSession: Session = {
+        frame: null,
+        streamId: "",
+        userId: "local",
+        chatId: "",
+        timestamp: Date.now(),
+        botId: active?.botId || "",
+      };
+      if (active) {
+        await handleNewSessionCommand(generateReqId("cmd"), fakeSession, active);
+        ctx.ui.notify("✅ 新会话已创建，机器人已切换", "info");
+      } else {
+        const cwd = ctx.cwd || process.cwd();
+        const globalCfg = await loadGlobalConfig();
+        const piWebUrl = getPiWebUrl(globalCfg);
+        try {
+          const res = await fetch(`${piWebUrl}/api/agent/new`, {
+            method: "POST",
+            headers: getPiWebHeaders(),
+            body: JSON.stringify({ cwd, type: "ensure_session" }),
+          });
+          if (res.ok) {
+            ctx.ui.notify("✅ 已通过 Web 创建新会话", "info");
+          } else {
+            await createFallbackSession(cwd);
+            ctx.ui.notify("✅ 已创建新会话", "info");
+          }
+        } catch {
+          await createFallbackSession(cwd);
+          ctx.ui.notify("✅ 已创建新会话", "info");
+        }
+      }
     },
   });
 
@@ -994,11 +1385,11 @@ ${sessionList}`, "info");
       currentCtx = ctx;
 
       // 解析稳定会话身份（此处才有 ctx），初始化会话级路径
-      SESSION_ID = resolveSessionId(ctx);
-      SESSION_CONFIG = getSessionConfigPath(SESSION_ID);
-      TEMP = getSessionTempPath(SESSION_ID);
-      console.log(`[wecombot] 会话ID: ${SESSION_ID.slice(0, 8)}`);
-      console.log(`[wecombot] 会话配置: ${SESSION_CONFIG}`);
+      sessionId = resolveSessionId(ctx);
+      sessionConfigPath = getSessionConfigPath(sessionId);
+      tempDir = getSessionTempPath(sessionId);
+      log(`[wecombot] 会话ID: ${sessionId.slice(0, 8)}`);
+      log(`[wecombot] 会话配置: ${sessionConfigPath}`);
 
       // 加载全局机器人列表
       const globalCfg = await loadGlobalConfig();
@@ -1007,7 +1398,7 @@ ${sessionList}`, "info");
       // 加载本会话配置
       sessionCfg = await loadSessionConfig();
 
-      await mkdir(TEMP, { recursive: true });
+      await mkdir(tempDir, { recursive: true });
 
       // 如果启用了且选择了机器人，则尝试连接（失败不影响 pi）
       if (sessionCfg.enabled && sessionCfg.activeBotId) {
@@ -1015,13 +1406,13 @@ ${sessionList}`, "info");
         if (bot) {
           const success = await connect(ctx, bot);
           if (!success) {
-            console.log(`[wecombot] 连接失败，但不影响 pi 使用`);
+            log(`[wecombot] 连接失败，但不影响 pi 使用`);
           }
         }
       }
       // 注意：不调用 setStatus，连接过程中 ws.on('connected') 会自动调用
     } catch (err) {
-      console.error(`[wecombot] session_start 异常:`, err);
+      logError(`[wecombot] session_start 异常:`, err);
       // 不影响 pi 启动
     }
   });
@@ -1030,7 +1421,7 @@ ${sessionList}`, "info");
     try {
       disconnect();
     } catch (err) {
-      console.error(`[wecombot] session_shutdown 异常:`, err);
+      logError(`[wecombot] session_shutdown 异常:`, err);
     }
   });
 
@@ -1052,6 +1443,7 @@ ${sessionList}`, "info");
     if (!msg?.content) {
       // 没有回复内容，移除消息并继续处理下一条
       clearProgressNotifier(currentReqId);
+      hasSentViaTool = false;
       pendingMessages.shift();
       currentReqId = null;
       processMessageQueue();
@@ -1061,6 +1453,7 @@ ${sessionList}`, "info");
     const txt = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
     if (!txt) {
       clearProgressNotifier(currentReqId);
+      hasSentViaTool = false;
       pendingMessages.shift();
       currentReqId = null;
       processMessageQueue();
@@ -1073,12 +1466,16 @@ ${sessionList}`, "info");
 
     // 回复给对应的用户
     if (replyContent.trim()) {
-      replyTo(pending.reqId, replyContent, true);
-
+      if (hasSentViaTool) {
+        log(`[wecombot] 当前请求已通过工具发送过内容，跳过 agent_end 自动发送（避免覆盖或重复发送确认语）: ${replyContent.slice(0, 30)}`);
+      } else {
+        replyTo(pending.reqId, replyContent, true);
+      }
     }
 
     // 【增强】清理进度通知定时器
     clearProgressNotifier(currentReqId);
+    hasSentViaTool = false;
 
     // 移除已处理的消息
     pendingMessages.shift();
