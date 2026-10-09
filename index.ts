@@ -780,11 +780,7 @@ export default function (pi: ExtensionAPI) {
       isProcessing = false;
       hasSentViaTool = false;
 
-      // 2. 发送过渡反馈（非阻塞）
-      if (session.frame) {
-        replyTo(reqId, "🔄 正在创建并切换至新会话...", false);
-      }
-
+      // 2. 准备会话参数
       const currentBotId = sessionCfg.activeBotId || bot.botId;
       const cwd = currentCtx?.cwd || process.cwd();
       const globalCfg = await loadGlobalConfig();
@@ -794,9 +790,28 @@ export default function (pi: ExtensionAPI) {
       await saveHandoff(currentBotId);
       log(`[wecombot] 已登记机器人交接凭证: ${currentBotId}`);
 
-      // 4. 给企微用户发送成功通知并结束气泡
+      // 4. 给企微用户发送成功通知并结束气泡（await 确保网络帧发出）
       if (session.frame) {
-        replyTo(reqId, "✅ 已开启新会话，开始新的对话吧！", true);
+        try {
+          await replyTo(reqId, "✅ 已开启新会话，开始新的对话吧！", true);
+          await new Promise((r) => setTimeout(r, 400));
+        } catch (e) {
+          logError(`[wecombot] 发送新会话切换提示异常:`, e);
+        }
+      } else if (session.isProactive) {
+        const targetId = session.chatId || session.userId;
+        if (targetId && ws && connected) {
+          try {
+            await ws.sendMessage(targetId, {
+              msgtype: "markdown",
+              markdown: { content: "✅ 已开启新会话，开始新的对话吧！" },
+            });
+            log(`[wecombot] 已主动推送新会话开启提示至: ${targetId}`);
+            await new Promise((r) => setTimeout(r, 400));
+          } catch (pushErr) {
+            logError(`[wecombot] 主动推送新会话提示失败:`, pushErr);
+          }
+        }
       }
 
       // 5. 禁用本会话并断开本会话长连，释放 BotID 占位
@@ -876,11 +891,22 @@ export default function (pi: ExtensionAPI) {
         }, 1500);
       }
 
+      return { success: true, newSessionId };
+
     } catch (err: any) {
       logError(`[wecombot] 切换新会话失败:`, err);
       if (session.frame) {
         replyTo(reqId, `❌ 切换新会话失败: ${err?.message || String(err)}`, true);
+      } else if (session.isProactive) {
+        const targetId = session.chatId || session.userId;
+        if (targetId && ws) {
+          ws.sendMessage(targetId, {
+            msgtype: "markdown",
+            markdown: { content: `❌ 切换新会话失败: ${err?.message || String(err)}` },
+          }).catch(() => {});
+        }
       }
+      throw err;
     }
   }
 
@@ -906,6 +932,39 @@ export default function (pi: ExtensionAPI) {
     const isGroup = target.startsWith("wr") || (target.length > 20 && target.includes("_"));
     const sessionUserId = isGroup ? "api_user" : target;
     const sessionChatId = isGroup ? target : "";
+
+    // 检查是否为新会话重置指令 (/new, /clear, /reset)
+    const cmd = parseCommandText(content);
+    if (cmd.isNew) {
+      log(`[wecombot] API 收到新会话重置指令: ${content}, 目标: ${target}`);
+      const reqId = generateReqId("api");
+      const session: Session = {
+        frame: null,
+        streamId: generateReqId("stream"),
+        userId: sessionUserId,
+        chatId: sessionChatId,
+        timestamp: Date.now(),
+        botId: active.botId,
+        isProactive: true,
+      };
+      sessions.set(reqId, session);
+
+      try {
+        const result = await handleNewSessionCommand(reqId, session, active, cmd.args);
+        return {
+          code: 0,
+          message: "新会话创建成功并已完成交接",
+          newSessionId: result?.newSessionId,
+          target,
+        };
+      } catch (err: any) {
+        return {
+          code: 500,
+          error: `创建新会话失败: ${err?.message || String(err)}`,
+          target,
+        };
+      }
+    }
 
     // 处理图片：下载/转存到会话临时目录
     const imagePaths: string[] = [];
