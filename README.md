@@ -231,6 +231,59 @@ pi install git:github.com/huang-x-h/pi-wecombot
 
 > **支持指令格式**：`/new`、`/clear`、`/reset`（群聊中包含 `@机器人 /new` 亦可自动识别）。
 
+## HTTP API 消息接口（主动接入与推送）
+
+插件内置轻量级 HTTP 接口服务（默认监听端口 `30142`，可通过 `PI_WECOMBOT_PORT` 环境变量或 `~/.pi/agent/wecom-bot.json` 中的 `apiServer.port` 自定义），支持外部系统、自动化脚本或监控告警主动向 Pi Agent 投递消息（文本/图片），Agent 思考分析后通过 SDK 主动推送到指定企业微信用户或群聊中。
+
+### 1. 发送消息接口
+
+- **路径**：`POST /api/message` 或 `POST /api/send`
+- **请求头**：`Content-Type: application/json`（若配置了 `apiKey`，需在 Header 附带 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`）
+- **请求体（JSON）**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `target` | string | **是** | 接收目标的企微 `userid`（单聊）或 `chatid`（群聊） |
+| `content` | string | 条件 | 消息正文文本（与 `images` 不能同时为空） |
+| `images` | string[] | 否 | 图片列表，支持本地绝对路径、网络图片 URL 或 Base64 数据 |
+| `sync` | boolean | 否 | 是否同步等待大模型完成处理并在 HTTP 响应中返回结果（默认 `false` 异步入队） |
+| `timeoutMs` | number | 否 | 同步等待超时时间（毫秒，默认 `180000` 即 3 分钟） |
+
+#### 异步发送示例（入队即返回，LLM 完成后通过企微 SDK 主动推送给目标）：
+```bash
+curl -X POST http://127.0.0.1:30142/api/message \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target": "woQoP7CwAAP4Jd-b_4mX1M6MoLg5mvbA",
+    "content": "请检查一下昨天的销售数据报告"
+  }'
+```
+
+#### 同步发送示例（等待大模型推理完，HTTP 返回回复正文，同时在企微推给用户）：
+```bash
+curl -X POST http://127.0.0.1:30142/api/message \
+  -H "Content-Type: application/json" \
+  -d '{
+    "target": "woQoP7CwAAP4Jd-b_4mX1M6MoLg5mvbA",
+    "content": "帮我写一个 Python 快速排序算法",
+    "sync": true
+  }'
+```
+
+### 2. 状态查询接口
+
+- **路径**：`GET /api/status`
+- **返回示例**：
+```json
+{
+  "connected": true,
+  "botId": "aibBqG_S6BekaSwM-iPsiTYAKSWXqBARCJE",
+  "name": "工作助手",
+  "sessionId": "01a11f48-4c8d-70a6-a0dd-a1cae3be0bd5",
+  "queueLength": 0
+}
+```
+
 ## 使用场景示例
 
 ### 场景1：团队协作，共享机器人池

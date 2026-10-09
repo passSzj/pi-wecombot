@@ -8,9 +8,11 @@
  */
 
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
 import { WSClient, generateReqId, decryptFile } from "@wecom/aibot-node-sdk";
 
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -75,10 +77,29 @@ interface BotConfig {
   name?: string;
 }
 
+// HTTP 消息服务配置
+interface ApiServerConfig {
+  enabled?: boolean; // 是否启用内置 HTTP 接收服务，默认 true
+  port?: number;    // 默认 30142
+  apiKey?: string;  // 可选安全校验密钥
+}
+
+// HTTP 消息请求体
+interface ApiMessageRequest {
+  content?: string;
+  type?: "text" | "image" | "mixed";
+  images?: string[]; // 支持本地文件绝对路径、http(s) 图片链接或 Base64
+  target: string;    // 目标用户的 userid 或群聊 chatid
+  botId?: string;    // 可选指定机器人
+  sync?: boolean;    // 是否同步等待回复返回结果
+  timeoutMs?: number;// 同步超时时间（毫秒，默认 180000 即 3分钟）
+}
+
 // 全局配置：所有会话共享机器人列表
 interface GlobalConfig {
   bots: BotConfig[];
   piWebUrl?: string; // 可选的 pi-web 服务地址（默认 http://127.0.0.1:30141）
+  apiServer?: ApiServerConfig; // 可选的 HTTP 接口配置
 }
 
 // 会话配置：每个会话独立选择启用哪个机器人
@@ -94,6 +115,8 @@ interface Session {
   chatId: string;
   timestamp: number;
   botId: string;
+  isProactive?: boolean; // 是否为主动推送模式（接口触发，无 frame）
+  syncResolver?: (result: { code: number; message: string; reply: string; error?: string }) => void;
 }
 
 // ============================================================================
@@ -145,7 +168,7 @@ const PROMPT = `
 async function loadGlobalConfig(): Promise<GlobalConfig> {
   try {
     const data = JSON.parse(await readFile(GLOBAL_CONFIG, "utf8"));
-    return { bots: data.bots || [], piWebUrl: data.piWebUrl };
+    return { bots: data.bots || [], piWebUrl: data.piWebUrl, apiServer: data.apiServer };
   } catch {
     return { bots: [] };
   }
@@ -223,6 +246,99 @@ function getPiWebHeaders(): Record<string, string> {
     headers["Authorization"] = `Basic ${Buffer.from(`pi:${password}`).toString("base64")}`;
   }
   return headers;
+}
+
+// 启动内置 HTTP 消息接口服务（单例）
+function startApiServer(port: number, apiKey?: string) {
+  if ((globalThis as any).__wecombotApiServer) {
+    return (globalThis as any).__wecombotApiServer;
+  }
+
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    // 跨域支持
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key");
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    const host = req.headers.host || `localhost:${port}`;
+    const url = new URL(req.url || "/", `http://${host}`);
+
+    // 健康检查与状态接口
+    if (url.pathname === "/api/status" && req.method === "GET") {
+      const getActive = (globalThis as any).__wecombotActiveBot;
+      const status = getActive ? getActive() : { connected: false, message: "无活跃会话连接" };
+      res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify(status, null, 2));
+      return;
+    }
+
+    // 消息发送接入接口
+    if ((url.pathname === "/api/message" || url.pathname === "/api/send") && req.method === "POST") {
+      // 鉴权校验
+      if (apiKey) {
+        const authHeader = req.headers["authorization"] || req.headers["x-api-key"];
+        const token = typeof authHeader === "string" ? authHeader.replace(/^Bearer\s+/i, "").trim() : "";
+        if (token !== apiKey) {
+          res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ code: 401, error: "未授权：API Key 错误" }));
+          return;
+        }
+      }
+
+      const handler = (globalThis as any).__wecombotActiveHandler;
+      if (!handler) {
+        res.writeHead(503, { "Content-Type": "application/json; charset=utf-8" });
+        res.end(JSON.stringify({ code: 503, error: "当前没有活跃连接的企业微信机器人会话" }));
+        return;
+      }
+
+      let bodyText = "";
+      req.on("data", (chunk) => {
+        bodyText += chunk;
+        if (bodyText.length > 10 * 1024 * 1024) {
+          req.destroy();
+        }
+      });
+
+      req.on("end", async () => {
+        try {
+          const bodyJson = JSON.parse(bodyText);
+          const responseData = await handler(bodyJson);
+          const statusCode = responseData.code === 0 ? 200 : (responseData.code || 500);
+          res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify(responseData, null, 2));
+        } catch (err: any) {
+          res.writeHead(400, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ code: 400, error: `请求体解析失败: ${err?.message || err}` }));
+        }
+      });
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ code: 404, error: "Not Found" }));
+  });
+
+  server.on("error", (err: any) => {
+    if (err.code === "EADDRINUSE") {
+      logWarn(`[wecombot] 端口 ${port} 已被占用，HTTP API 服务未能启动`);
+    } else {
+      logError(`[wecombot] HTTP API 服务异常:`, err);
+    }
+  });
+
+  server.listen(port, "0.0.0.0", () => {
+    log(`[wecombot] 🚀 HTTP 消息接入接口已就绪: http://127.0.0.1:${port}/api/message`);
+  });
+
+  (globalThis as any).__wecombotApiServer = server;
+  return server;
 }
 
 function getActiveBot(bots: BotConfig[], activeBotId?: string): BotConfig | undefined {
@@ -398,6 +514,7 @@ export default function (pi: ExtensionAPI) {
         clearInterval(checkInterval);
       }
     }, PROGRESS_NOTIFY_INTERVAL);
+    checkInterval.unref();
 
     messageTimeouts.set(reqId + '_progress', checkInterval);
   }
@@ -453,6 +570,11 @@ export default function (pi: ExtensionAPI) {
         hasSentViaTool = false;
       } else {
         logError('[wecombot] 发送消息失败:', err);
+        const session = sessions.get(message.reqId);
+        if (session?.syncResolver) {
+          session.syncResolver({ code: 500, message: "发送至 Agent 失败", reply: "", error: String(err?.message || err) });
+          session.syncResolver = undefined;
+        }
         pendingMessages.shift();  // 移除失败消息
         currentReqId = null;
         hasSentViaTool = false;
@@ -483,7 +605,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   // 清理过期会话
-  setInterval(() => {
+  const expiryTimer = setInterval(() => {
     const now = Date.now();
     for (const [reqId, session] of sessions) {
       if (now - session.timestamp > 60 * 60 * 1000) {
@@ -491,6 +613,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
   }, 60000);
+  expiryTimer.unref();
 
   // Status - 已连接后才显示，未连接时不显示
   function setStatus(ctx: ExtensionContext | null, msg?: string) {
@@ -535,19 +658,59 @@ export default function (pi: ExtensionAPI) {
       log(`[wecombot] 回复失败: 会话不存在, reqId=${reqId.slice(0, 8)}, 当前sessions=${sessions.size}`);
       return Promise.resolve();
     }
-    const p = ws.replyStream(session.frame, session.streamId, content, isEnd).catch((err: any) => {
-      // 忽略流已过期错误（正常情况，10分钟后自动触发）
-      if (err?.errcode === 846608 || err?.message?.includes('expired')) {
-        log(`[wecombot] 流已过期: reqId=${reqId.slice(0, 8)}`);
-      } else {
-        logError(`[wecombot] 回复异常: reqId=${reqId.slice(0, 8)}`, err);
+
+    // 分流 1：企微原生被动交互（有 frame）➔ 调用 replyStream 流式回复
+    if (session.frame) {
+      const p = ws.replyStream(session.frame, session.streamId, content, isEnd).catch((err: any) => {
+        // 忽略流已过期错误（正常情况，10分钟后自动触发）
+        if (err?.errcode === 846608 || err?.message?.includes('expired')) {
+          log(`[wecombot] 流已过期: reqId=${reqId.slice(0, 8)}`);
+        } else {
+          logError(`[wecombot] 回复异常: reqId=${reqId.slice(0, 8)}`, err);
+        }
+      });
+      // 当流式消息结束时，为该会话生成新的 streamId，确保后续消息不会覆盖已结束的气泡
+      if (isEnd) {
+        session.streamId = generateReqId("stream");
       }
-    });
-    // 当流式消息结束时，为该会话生成新的 streamId，确保后续消息不会覆盖已结束的气泡
-    if (isEnd) {
-      session.streamId = generateReqId("stream");
+      return p;
     }
-    return p;
+
+    // 分流 2：主动推送模式（接口触发，无 frame）➔ 调用 SDK 主动推送 sendMessage
+    if (session.isProactive) {
+      if (isEnd && content.trim()) {
+        const targetId = session.chatId || session.userId;
+        log(`[wecombot] 正在通过 SDK 主动推送回复至目标: ${targetId}`);
+        if (content.length > 4000) {
+          const chunks: string[] = [];
+          for (let i = 0; i < content.length; i += 4000) {
+            chunks.push(content.slice(i, i + 4000));
+          }
+          let lastPromise = Promise.resolve();
+          for (const c of chunks) {
+            lastPromise = lastPromise.then(() =>
+              ws!.sendMessage(targetId, {
+                msgtype: "markdown",
+                markdown: { content: c },
+              }).then(() => {})
+            );
+          }
+          return lastPromise.catch((err: any) => {
+            logError(`[wecombot] 主动推送消息异常: reqId=${reqId.slice(0, 8)}`, err);
+          });
+        }
+
+        return ws.sendMessage(targetId, {
+          msgtype: "markdown",
+          markdown: { content },
+        }).catch((err: any) => {
+          logError(`[wecombot] 主动推送消息异常: reqId=${reqId.slice(0, 8)}`, err);
+        });
+      }
+      return Promise.resolve();
+    }
+
+    return Promise.resolve();
   }
 
   // 解析是否包含新会话重置指令
@@ -721,6 +884,127 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // 处理外部 HTTP 接口传入的主动消息
+  async function handleApiMessage(req: ApiMessageRequest): Promise<any> {
+    const active = getActiveBot(globalBots, sessionCfg.activeBotId);
+    if (!ws || !connected || !active) {
+      return { code: 503, error: "机器人未连接，请先在会话中启用机器人" };
+    }
+
+    const target = req.target?.trim();
+    if (!target) {
+      return { code: 400, error: "缺少 target 参数 (接收方的 userid 或 chatid)" };
+    }
+
+    const content = req.content?.trim() || "";
+    const images = Array.isArray(req.images) ? req.images : [];
+    if (!content && images.length === 0) {
+      return { code: 400, error: "content 和 images 不能同时为空" };
+    }
+
+    // 确定是单聊还是群聊
+    const isGroup = target.startsWith("wr") || (target.length > 20 && target.includes("_"));
+    const sessionUserId = isGroup ? "api_user" : target;
+    const sessionChatId = isGroup ? target : "";
+
+    // 处理图片：下载/转存到会话临时目录
+    const imagePaths: string[] = [];
+    const currentTemp = getTempDir();
+    await mkdir(currentTemp, { recursive: true });
+
+    for (let i = 0; i < images.length; i++) {
+      const img = images[i];
+      try {
+        if (img.startsWith("http://") || img.startsWith("https://")) {
+          const res = await fetch(img);
+          if (res.ok) {
+            const buffer = Buffer.from(await res.arrayBuffer());
+            const fn = `img_api_${Date.now()}_${i}.jpg`;
+            const fp = join(currentTemp, fn);
+            await writeFile(fp, buffer);
+            imagePaths.push(fp);
+            log(`[wecombot] API 图片下载完成: ${fp}`);
+          } else {
+            logWarn(`[wecombot] API 图片下载失败: ${img}, status: ${res.status}`);
+          }
+        } else if (img.startsWith("data:image/") || (img.length > 200 && !img.includes("\n"))) {
+          const base64Data = img.replace(/^data:image\/\w+;base64,/, "");
+          const buffer = Buffer.from(base64Data, "base64");
+          const fn = `img_api_${Date.now()}_${i}.jpg`;
+          const fp = join(currentTemp, fn);
+          await writeFile(fp, buffer);
+          imagePaths.push(fp);
+          log(`[wecombot] API Base64 图片已保存: ${fp}`);
+        } else if (existsSync(img) || (await stat(img).catch(() => null))?.isFile()) {
+          imagePaths.push(img);
+        }
+      } catch (err) {
+        logError(`[wecombot] API 处理图片异常:`, err);
+      }
+    }
+
+    const reqId = generateReqId("api");
+    const session: Session = {
+      frame: null,
+      streamId: generateReqId("stream"),
+      userId: sessionUserId,
+      chatId: sessionChatId,
+      timestamp: Date.now(),
+      botId: active.botId,
+      isProactive: true,
+    };
+    sessions.set(reqId, session);
+
+    // 组装 Prompt 包装文本
+    const botName = active.name || active.botId;
+    let packagedText = `[wecombot] [${botName}] [${sessionUserId}]`;
+    if (sessionChatId) packagedText += ` [group:${sessionChatId}]`;
+    if (content) packagedText += `\n${content}`;
+    if (imagePaths.length > 0) {
+      for (const p of imagePaths) {
+        packagedText += `\n[图片: ${p}]`;
+      }
+    }
+
+    log(`[wecombot] API 消息进入队列: reqId=${reqId.slice(0, 8)}, target=${target}, 内容: ${content.slice(0, 30)}`);
+
+    if (req.sync) {
+      return new Promise((resolve) => {
+        const timeoutMs = req.timeoutMs || 180000;
+        const timer = setTimeout(() => {
+          session.syncResolver = undefined;
+          resolve({
+            code: 504,
+            error: `LLM 处理超时 (${Math.round(timeoutMs / 1000)}s)`,
+            reqId,
+            target,
+          });
+        }, timeoutMs);
+
+        session.syncResolver = (result) => {
+          clearTimeout(timer);
+          resolve({
+            code: result.code,
+            message: result.message,
+            reply: result.reply,
+            reqId,
+            target,
+          });
+        };
+
+        queueMessage(reqId, packagedText, session);
+      });
+    } else {
+      queueMessage(reqId, packagedText, session);
+      return {
+        code: 0,
+        message: "消息已成功接收并进入处理队列",
+        reqId,
+        target,
+      };
+    }
+  }
+
   // 连接 - 添加错误保护
   async function connect(ctx: ExtensionContext, bot: BotConfig): Promise<boolean> {
     try {
@@ -765,6 +1049,16 @@ export default function (pi: ExtensionAPI) {
           registerTools();
           toolsRegistered = true;
         }
+
+        // 注册当前活跃会话的处理函数
+        (globalThis as any).__wecombotActiveHandler = handleApiMessage;
+        (globalThis as any).__wecombotActiveBot = () => ({
+          connected,
+          botId: bot.botId,
+          name: bot.name,
+          sessionId,
+          queueLength: pendingMessages.length,
+        });
       });
 
       ws.on("message.text", async (frame: any) => {
@@ -1005,6 +1299,9 @@ ${contentText}${imageText}`, session);
     sessions.clear();
     if (ws) { ws.disconnect(); ws = null; }
     connected = false;
+    if ((globalThis as any).__wecombotActiveHandler === handleApiMessage) {
+      (globalThis as any).__wecombotActiveHandler = null;
+    }
   }
 
   // ============================================================================
@@ -1023,9 +1320,32 @@ ${contentText}${imageText}`, session);
       async execute(toolCallId, params, signal, onUpdate, ctx) {
         if (!isWecomConnected()) return { content: [{ type: "text", text: "⚠️ 机器人未连接" }], details: {} };
         const reqId = currentReqId || sessions.keys().next().value;
-        if (!reqId) return { content: [{ type: "text", text: "⚠️ 无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。" }], details: {} };
+        const session = reqId ? sessions.get(reqId) : undefined;
+        const targetId = session?.chatId || session?.userId;
         const files: string[] = [];
         for (const fp of params.paths) if ((await stat(fp)).isFile()) files.push(fp);
+
+        if (session?.isProactive && targetId && ws) {
+          for (const fp of files) {
+            try {
+              const buffer = await readFile(fp);
+              const filename = basename(fp);
+              const ext = filename.split(".").pop()?.toLowerCase();
+              let mediaType: "file" | "image" | "video" = "file";
+              if (["jpg", "jpeg", "png", "gif", "webp"].includes(ext || "")) mediaType = "image";
+              else if (["mp4", "mov"].includes(ext || "")) mediaType = "video";
+
+              const uploadRes = await ws.uploadMedia(buffer, { type: mediaType, filename });
+              await ws.sendMediaMessage(targetId, mediaType, uploadRes.media_id);
+              log(`[wecombot] 主动推送附件成功: ${filename} -> ${targetId}`);
+            } catch (err) {
+              logError(`[wecombot] 主动推送附件失败:`, err);
+            }
+          }
+          return { content: [{ type: "text", text: `已主动推送 ${files.length} 个文件到企业微信` }], details: {} };
+        }
+
+        if (!reqId) return { content: [{ type: "text", text: "⚠️ 无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。" }], details: {} };
         for (const fp of files) replyTo(reqId, `📎 ${basename(fp)}`, true);
         return { content: [{ type: "text", text: `已添加 ${files.length} 个文件` }], details: {} };
       },
@@ -1043,6 +1363,18 @@ ${contentText}${imageText}`, session);
       async execute(toolCallId, params, signal, onUpdate, ctx) {
         if (!isWecomConnected()) return { content: [{ type: "text", text: "⚠️ 机器人未连接" }], details: {} };
         const reqId = currentReqId || sessions.keys().next().value;
+        const session = reqId ? sessions.get(reqId) : undefined;
+        if (session?.isProactive) {
+          const targetId = session.chatId || session.userId;
+          if (targetId && ws) {
+            await ws.sendMessage(targetId, {
+              msgtype: "markdown",
+              markdown: { content: params.message },
+            });
+            hasSentViaTool = true;
+            return { content: [{ type: "text", text: "✅ 已主动推送" }], details: {} };
+          }
+        }
         if (!reqId) return { content: [{ type: "text", text: "⚠️ 无法发送：企业微信需要先收到用户消息才能回复。请等待用户发消息后再发送。" }], details: {} };
         replyTo(reqId, params.message, true);
         hasSentViaTool = true;
@@ -1403,6 +1735,12 @@ ${sessionList}`, "info");
       const globalCfg = await loadGlobalConfig();
       globalBots = globalCfg.bots;
 
+      // 如果启用了 HTTP 接口服务，确保启动
+      if (globalCfg.apiServer?.enabled !== false) {
+        const port = Number(process.env.PI_WECOMBOT_PORT || globalCfg.apiServer?.port || 30142);
+        startApiServer(port, globalCfg.apiServer?.apiKey);
+      }
+
       // 加载本会话配置
       sessionCfg = await loadSessionConfig();
 
@@ -1473,6 +1811,11 @@ ${sessionList}`, "info");
     const msg = e.messages[e.messages.length - 1] as any;
     if (!msg?.content) {
       // 没有回复内容，移除消息并继续处理下一条
+      const session = sessions.get(currentReqId);
+      if (session?.syncResolver) {
+        session.syncResolver({ code: 500, message: "模型未返回内容", reply: "" });
+        session.syncResolver = undefined;
+      }
       clearProgressNotifier(currentReqId);
       hasSentViaTool = false;
       pendingMessages.shift();
@@ -1483,6 +1826,11 @@ ${sessionList}`, "info");
 
     const txt = (msg.content as any[])?.find((b: any) => b.type === "text")?.text;
     if (!txt) {
+      const session = sessions.get(currentReqId);
+      if (session?.syncResolver) {
+        session.syncResolver({ code: 500, message: "模型未返回文本内容", reply: "" });
+        session.syncResolver = undefined;
+      }
       clearProgressNotifier(currentReqId);
       hasSentViaTool = false;
       pendingMessages.shift();
@@ -1495,6 +1843,8 @@ ${sessionList}`, "info");
     const pattern = new RegExp(`\\[wecombot\\] \\[${active?.name || active?.botId || ""}\\] \\[([^\\]]+)\\]\\n?`, "g");
     const replyContent = txt.replace(pattern, "");
 
+    const session = sessions.get(pending.reqId);
+
     // 回复给对应的用户
     if (replyContent.trim()) {
       if (hasSentViaTool) {
@@ -1502,6 +1852,16 @@ ${sessionList}`, "info");
       } else {
         replyTo(pending.reqId, replyContent, true);
       }
+    }
+
+    // 如果是同步 API 请求，唤醒 HTTP 响应
+    if (session?.syncResolver) {
+      session.syncResolver({
+        code: 0,
+        message: "处理完成并已通过 SDK 主动推送",
+        reply: replyContent.trim(),
+      });
+      session.syncResolver = undefined;
     }
 
     // 【增强】清理进度通知定时器
