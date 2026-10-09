@@ -164,6 +164,47 @@ async function saveSessionConfigForId(sessionId: string, c: SessionConfig) {
   await writeFile(cfgPath, JSON.stringify(c, null, "\t") + "\n");
 }
 
+function getHandoffFilePath(): string {
+  return join(homedir(), ".pi", "agent", "wecom-bot-handoff.json");
+}
+
+interface HandoffData {
+  activeBotId: string;
+  timestamp: number;
+}
+
+// 登记全局交接凭证（让新会话在 session_start 时自动认领机器人）
+async function saveHandoff(botId: string) {
+  const data: HandoffData = { activeBotId: botId, timestamp: Date.now() };
+  (globalThis as any).__wecombotPendingHandoff = data;
+  try {
+    await mkdir(dirname(getHandoffFilePath()), { recursive: true });
+    await writeFile(getHandoffFilePath(), JSON.stringify(data, null, "\t") + "\n");
+  } catch (err) {
+    logWarn(`[wecombot] 写入交接凭证文件失败:`, err);
+  }
+}
+
+// 认领并消费交接凭证（60秒内有效，单次消费）
+async function consumeHandoff(): Promise<HandoffData | null> {
+  const memHandoff = (globalThis as any).__wecombotPendingHandoff as HandoffData | undefined;
+  if (memHandoff && Date.now() - memHandoff.timestamp < 60_000) {
+    (globalThis as any).__wecombotPendingHandoff = null;
+    try { await writeFile(getHandoffFilePath(), "{}\n"); } catch {}
+    return memHandoff;
+  }
+  try {
+    const raw = await readFile(getHandoffFilePath(), "utf8");
+    const data = JSON.parse(raw) as HandoffData;
+    if (data?.activeBotId && Date.now() - data.timestamp < 60_000) {
+      (globalThis as any).__wecombotPendingHandoff = null;
+      try { await writeFile(getHandoffFilePath(), "{}\n"); } catch {}
+      return data;
+    }
+  } catch {}
+  return null;
+}
+
 // 获取 pi-web 访问地址
 function getPiWebUrl(globalCfg?: GlobalConfig): string {
   if (globalCfg?.piWebUrl) return globalCfg.piWebUrl.replace(/\/+$/, "");
@@ -556,39 +597,6 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // 触发新会话加载并接管连接
-  async function triggerSessionReload(newSessionId: string, piWebUrl: string) {
-    // 方式 A：进程内直接调用已注册的 AgentSessionWrapper
-    const inMemoryWrapper = (globalThis as any).__piSessions?.get(newSessionId);
-    if (inMemoryWrapper && typeof inMemoryWrapper.send === "function") {
-      log(`[wecombot] 正在通过进程内 AgentSessionWrapper 触发新会话 reload: ${newSessionId.slice(0, 8)}`);
-      try {
-        await inMemoryWrapper.send({ type: "reload" });
-        log(`[wecombot] 进程内 reload 触发成功`);
-        return;
-      } catch (err) {
-        logWarn(`[wecombot] 进程内 reload 异常，尝试 HTTP API:`, err);
-      }
-    }
-
-    // 方式 B：通过 HTTP 接口触发
-    try {
-      log(`[wecombot] 正在通过 HTTP POST /api/agent/${newSessionId.slice(0, 8)} 触发 reload`);
-      const res = await fetch(`${piWebUrl}/api/agent/${encodeURIComponent(newSessionId)}`, {
-        method: "POST",
-        headers: getPiWebHeaders(),
-        body: JSON.stringify({ type: "reload" }),
-      });
-      if (res.ok) {
-        log(`[wecombot] HTTP reload 触发成功`);
-      } else {
-        logWarn(`[wecombot] HTTP reload 返回状态码: ${res.status}`);
-      }
-    } catch (err: any) {
-      logWarn(`[wecombot] HTTP reload 请求异常:`, err?.message || err);
-    }
-  }
-
   // 处理新会话切换逻辑
   async function handleNewSessionCommand(
     reqId: string,
@@ -609,9 +617,9 @@ export default function (pi: ExtensionAPI) {
       isProcessing = false;
       hasSentViaTool = false;
 
-      // 2. 发送过渡反馈
+      // 2. 发送过渡反馈（非阻塞）
       if (session.frame) {
-        await replyTo(reqId, "🔄 正在创建并切换至新会话...", false);
+        replyTo(reqId, "🔄 正在创建并切换至新会话...", false);
       }
 
       const currentBotId = sessionCfg.activeBotId || bot.botId;
@@ -619,9 +627,27 @@ export default function (pi: ExtensionAPI) {
       const globalCfg = await loadGlobalConfig();
       const piWebUrl = getPiWebUrl(globalCfg);
 
+      // 3. 登记交接凭证，让新会话在 session_start 时自动认领机器人并连接
+      await saveHandoff(currentBotId);
+      log(`[wecombot] 已登记机器人交接凭证: ${currentBotId}`);
+
+      // 4. 给企微用户发送成功通知并结束气泡
+      if (session.frame) {
+        replyTo(reqId, "✅ 已开启新会话，开始新的对话吧！", true);
+      }
+
+      // 5. 禁用本会话并断开本会话长连，释放 BotID 占位
+      sessionCfg.enabled = false;
+      await saveSessionConfig(sessionCfg);
+      disconnect();
+      setStatus(currentCtx, "已切换到新会话");
+
+      // 6. 等待 400ms 确保旧长连完全释放并在企微网关下线
+      await new Promise((r) => setTimeout(r, 400));
+
       let newSessionId: string | null = null;
 
-      // 3. 优先通过 pi-web 创建新 session
+      // 7. 优先通过 pi-web 创建新 session（新 session 会在其 session_start 中直接认领凭证并连接）
       try {
         log(`[wecombot] 请求 pi-web 创建新会话: ${piWebUrl}/api/agent/new, cwd=${cwd}`);
         const res = await fetch(`${piWebUrl}/api/agent/new`, {
@@ -644,7 +670,7 @@ export default function (pi: ExtensionAPI) {
           const data = (await res.json()) as any;
           if (data?.success && data?.sessionId) {
             newSessionId = data.sessionId;
-            log(`[wecombot] pi-web 创建新会话成功: ${newSessionId?.slice(0, 8)}`);
+            log(`[wecombot] pi-web 创建新会话成功并已完成交接: ${newSessionId?.slice(0, 8)}`);
           }
         } else {
           logWarn(`[wecombot] pi-web /api/agent/new 响应状态码 ${res.status}: ${await res.text()}`);
@@ -653,40 +679,21 @@ export default function (pi: ExtensionAPI) {
         logWarn(`[wecombot] 请求 pi-web /api/agent/new 异常:`, err?.message || err);
       }
 
-      // 4. 若无法连接 pi-web，则采用本地创建 session 文件的后备方案
+      // 8. 若无法连接 pi-web，则采用本地创建 session 文件的后备方案
       if (!newSessionId) {
         newSessionId = await createFallbackSession(cwd);
+        if (newSessionId) {
+          await saveSessionConfigForId(newSessionId, {
+            activeBotId: currentBotId,
+            enabled: true,
+          });
+          await consumeHandoff();
+        }
       }
 
       if (!newSessionId) {
         throw new Error("创建新会话失败，无法生成新会话");
       }
-
-      // 5. 将当前机器人的活跃配置写入新会话
-      await saveSessionConfigForId(newSessionId, {
-        activeBotId: currentBotId,
-        enabled: true,
-      });
-      log(`[wecombot] 新会话配置已写入: ${newSessionId.slice(0, 8)}`);
-
-      // 6. 给企微用户发送成功通知并结束气泡
-      if (session.frame) {
-        await replyTo(reqId, "✅ 已开启新会话，开始新的对话吧！", true);
-        // 等待 300ms 保证 WebSocket 消息帧发送完毕
-        await new Promise((r) => setTimeout(r, 300));
-      }
-
-      // 7. 禁用本会话并断开本会话连接，释放 BotID 长连
-      sessionCfg.enabled = false;
-      await saveSessionConfig(sessionCfg);
-      disconnect();
-      setStatus(currentCtx, "已切换到新会话");
-
-      // 等待 500ms 确保旧长连在网关完全断开释放，避免与新会话连接产生竞争
-      await new Promise((r) => setTimeout(r, 500));
-
-      // 8. 触发新会话 reload 以接管机器人连接
-      await triggerSessionReload(newSessionId, piWebUrl);
 
       // 9. 如果用户在 /new 后附带了文本（例如 `/new 请帮我分析...`），延迟发送到新会话
       if (initialPrompt && initialPrompt.trim()) {
@@ -1398,6 +1405,17 @@ ${sessionList}`, "info");
       // 加载本会话配置
       sessionCfg = await loadSessionConfig();
 
+      // 如果本会话未配置 activeBotId，检查是否有交接凭证（由 /new 触发）
+      if (!sessionCfg.activeBotId) {
+        const handoff = await consumeHandoff();
+        if (handoff && handoff.activeBotId) {
+          sessionCfg.activeBotId = handoff.activeBotId;
+          sessionCfg.enabled = true;
+          await saveSessionConfig(sessionCfg);
+          log(`[wecombot] 成功认领新会话交接凭证，继承机器人: ${sessionCfg.activeBotId}`);
+        }
+      }
+
       await mkdir(tempDir, { recursive: true });
 
       // 如果启用了且选择了机器人，则尝试连接（失败不影响 pi）
@@ -1410,6 +1428,18 @@ ${sessionList}`, "info");
           }
         }
       }
+
+      // 保持会话保活，防止 pi-web 10分钟空闲超时把连接的会话自动 shutdown
+      try {
+        const livenessRegistry = (globalThis as any)["@agegr/pi-web/session-liveness/v1"];
+        if (livenessRegistry && typeof livenessRegistry.register === "function") {
+          livenessRegistry.register({
+            name: "wecombot",
+            sessionId,
+            isActive: () => isWecomConnected(),
+          });
+        }
+      } catch {}
       // 注意：不调用 setStatus，连接过程中 ws.on('connected') 会自动调用
     } catch (err) {
       logError(`[wecombot] session_start 异常:`, err);
