@@ -250,8 +250,13 @@ function getPiWebHeaders(): Record<string, string> {
 
 // 启动内置 HTTP 消息接口服务（单例）
 function startApiServer(port: number, apiKey?: string) {
-  if ((globalThis as any).__wecombotApiServer) {
-    return (globalThis as any).__wecombotApiServer;
+  const existing = (globalThis as any).__wecombotApiServer as Server | undefined;
+  if (existing) {
+    if (existing.listening) {
+      return existing;
+    }
+    try { existing.close(); } catch {}
+    (globalThis as any).__wecombotApiServer = null;
   }
 
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
@@ -326,6 +331,9 @@ function startApiServer(port: number, apiKey?: string) {
   });
 
   server.on("error", (err: any) => {
+    if ((globalThis as any).__wecombotApiServer === server) {
+      (globalThis as any).__wecombotApiServer = null;
+    }
     if (err.code === "EADDRINUSE") {
       logWarn(`[wecombot] 端口 ${port} 已被占用，HTTP API 服务未能启动`);
     } else {
@@ -333,11 +341,17 @@ function startApiServer(port: number, apiKey?: string) {
     }
   });
 
+  server.on("close", () => {
+    if ((globalThis as any).__wecombotApiServer === server) {
+      (globalThis as any).__wecombotApiServer = null;
+    }
+  });
+
   server.listen(port, "0.0.0.0", () => {
+    (globalThis as any).__wecombotApiServer = server;
     log(`[wecombot] 🚀 HTTP 消息接入接口已就绪: http://127.0.0.1:${port}/api/message`);
   });
 
-  (globalThis as any).__wecombotApiServer = server;
   return server;
 }
 
