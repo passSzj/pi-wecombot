@@ -80,7 +80,7 @@ interface BotConfig {
 // HTTP 消息服务配置
 interface ApiServerConfig {
   enabled?: boolean; // 是否启用内置 HTTP 接收服务，默认 true
-  port?: number;    // 默认 30142
+  port?: number;    // 默认 30143 (避开 pi-web 服务端口 30142)
   apiKey?: string;  // 可选安全校验密钥
 }
 
@@ -98,7 +98,7 @@ interface ApiMessageRequest {
 // 全局配置：所有会话共享机器人列表
 interface GlobalConfig {
   bots: BotConfig[];
-  piWebUrl?: string; // 可选的 pi-web 服务地址（默认 http://127.0.0.1:30141）
+  piWebUrl?: string; // 可选的 pi-web 服务地址（默认 http://127.0.0.1:30142）
   apiServer?: ApiServerConfig; // 可选的 HTTP 接口配置
 }
 
@@ -232,7 +232,7 @@ async function consumeHandoff(): Promise<HandoffData | null> {
 function getPiWebUrl(globalCfg?: GlobalConfig): string {
   if (globalCfg?.piWebUrl) return globalCfg.piWebUrl.replace(/\/+$/, "");
   if (process.env.PI_WEB_URL) return process.env.PI_WEB_URL.replace(/\/+$/, "");
-  const port = process.env.PI_WEB_PORT || process.env.PORT || "30141";
+  const port = process.env.PI_WEB_PORT || process.env.PORT || "30142";
   return `http://127.0.0.1:${port}`;
 }
 
@@ -1796,7 +1796,7 @@ ${sessionList}`, "info");
 
       // 如果启用了 HTTP 接口服务，确保启动
       if (globalCfg.apiServer?.enabled !== false) {
-        const port = Number(process.env.PI_WECOMBOT_PORT || globalCfg.apiServer?.port || 30142);
+        const port = Number(process.env.PI_WECOMBOT_PORT || globalCfg.apiServer?.port || 30143);
         startApiServer(port, globalCfg.apiServer?.apiKey);
       }
 

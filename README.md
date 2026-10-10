@@ -224,7 +224,7 @@ pi install git:github.com/huang-x-h/pi-wecombot
 #### `/new` 或 `/wecombot-new` - 新建会话并切换（联动 pi-web）
 
 在企业微信中直接发送 `/new`（或在 Web/终端中执行 `/wecombot-new`），会自动：
-1. 优先调用 pi-web 的 API（默认 `http://127.0.0.1:30141/api/agent/new`）新建一个全新的 pi session；
+1. 优先调用 pi-web 的 API（默认 `http://127.0.0.1:30142/api/agent/new`）新建一个全新的 pi session；
 2. 自动将当前活跃的机器人配置继承至新 session；
 3. 断开旧 session 的机器人长连，由新 session 接管 WebSocket 连接；
 4. pi-web 的左侧侧边栏会联动即时出现新增的 session，后续在企微中的对话将全部路由至新 session，不再停留在旧 session 中。
@@ -233,7 +233,7 @@ pi install git:github.com/huang-x-h/pi-wecombot
 
 ## HTTP API 消息接口（主动接入与推送）
 
-插件内置轻量级 HTTP 接口服务（默认监听端口 `30142`，可通过 `PI_WECOMBOT_PORT` 环境变量或 `~/.pi/agent/wecom-bot.json` 中的 `apiServer.port` 自定义），支持外部系统、自动化脚本或监控告警主动向 Pi Agent 投递消息（文本/图片），Agent 思考分析后通过 SDK 主动推送到指定企业微信用户或群聊中。
+插件内置轻量级 HTTP 接口服务（默认监听端口 `30143`，可通过 `PI_WECOMBOT_PORT` 环境变量或 `~/.pi/agent/wecom-bot.json` 中的 `apiServer.port` 自定义；已避开 pi-web 的 `30142` 端口），支持外部系统、自动化脚本或监控告警主动向 Pi Agent 投递消息（文本/图片），Agent 思考分析后通过 SDK 主动推送到指定企业微信用户或群聊中。
 
 ### 1. 发送消息接口
 
@@ -251,7 +251,7 @@ pi install git:github.com/huang-x-h/pi-wecombot
 
 #### 异步发送示例（入队即返回，LLM 完成后通过企微 SDK 主动推送给目标）：
 ```bash
-curl -X POST http://127.0.0.1:30142/api/message \
+curl -X POST http://127.0.0.1:30143/api/message \
   -H "Content-Type: application/json" \
   -d '{
     "target": "woQoP7CwAAP4Jd-b_4mX1M6MoLg5mvbA",
@@ -261,7 +261,7 @@ curl -X POST http://127.0.0.1:30142/api/message \
 
 #### 同步发送示例（等待大模型推理完，HTTP 返回回复正文，同时在企微推给用户）：
 ```bash
-curl -X POST http://127.0.0.1:30142/api/message \
+curl -X POST http://127.0.0.1:30143/api/message \
   -H "Content-Type: application/json" \
   -d '{
     "target": "woQoP7CwAAP4Jd-b_4mX1M6MoLg5mvbA",
